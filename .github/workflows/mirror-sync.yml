@@ -5,7 +5,7 @@ name: Mirror Sync (upstream → this repo)
 
 on:
   schedule:
-    - cron: '17 3 * * *'   # 毎日 03:17 UTC = 12:17 JST
+    - cron: '17 19 * * *'   # 毎日 19:17 UTC = 翌 04:17 JST
   workflow_dispatch:
     inputs:
       allow_shrink:

@@ -17,7 +17,7 @@
 
 ## 同期の安全性
 
-`.github/workflows/mirror-sync.yml` が毎日 12:17 JST に上流を追従します。
+`.github/workflows/mirror-sync.yml` が毎日 04:17 JST に上流を追従します。
 **force-push は一切行いません**（すべて追記のみ）。そのため以下が保証されます。
 
 - 過去にこのミラーへ取り込まれた内容は、後の同期で消えることがない
