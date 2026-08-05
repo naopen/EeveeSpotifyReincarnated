@@ -1,0 +1,311 @@
+name: Mirror Sync (upstream → this repo)
+
+# 上流を追従するが「追記のみ」。force-push は一切しないため、
+# 上流が中身を消した / 履歴を書き換えた場合でもこのリポジトリの過去の内容は失われない。
+
+on:
+  schedule:
+    - cron: '17 3 * * *'   # 毎日 03:17 UTC = 12:17 JST
+  workflow_dispatch:
+    inputs:
+      allow_shrink:
+        description: '大量削除ガードを無視して同期する（上流の変更を目視確認済みの場合のみ true）'
+        default: 'false'
+        type: choice
+        options: ['false', 'true']
+      sync_releases:
+        description: '上流の Releases とその添付ファイルもミラーする'
+        default: 'true'
+        type: choice
+        options: ['true', 'false']
+
+concurrency:
+  group: mirror-sync
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # Releases のミラーに使用。git push は deploy key(SSH) で行う
+
+env:
+  UPSTREAM_URL: https://github.com/SideloadLabs/EeveeSpotifyReincarnated.git
+  UPSTREAM_REPO: SideloadLabs/EeveeSpotifyReincarnated
+  UPSTREAM_DEFAULT: Master
+  # Master 以外に追従するブランチ（空白区切り）。非 fast-forward なら警告のみでスキップ。
+  SIDE_BRANCHES: 'hysan test'
+  # 1回の同期で削除されるファイルが全体の何 % を超えたら中止するか
+  MAX_DELETE_PERCENT: '25'
+  # 同期後の追跡ファイル数がこれを下回ったら中止
+  MIN_FILES: '50'
+  # Master に新しいコミットが無い状態がこの日数を超えたら heartbeat コミットを打つ
+  # （GitHub は 60 日間リポジトリ活動が無いと schedule を自動停止するため）
+  HEARTBEAT_AFTER_DAYS: '30'
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      # 書き込み権限付き deploy key(SSH) で checkout する。
+      # 既定の GITHUB_TOKEN は .github/workflows/ 配下を push できない
+      # （上流のコミットは workflow を変更しうるため）が、この制限は
+      # GitHub App トークン固有で SSH deploy key には適用されない。
+      - name: Checkout mirror (full history, all refs)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.UPSTREAM_DEFAULT }}
+          fetch-depth: 0
+          ssh-key: ${{ secrets.MIRROR_SSH_KEY }}
+          persist-credentials: true
+
+      - name: Configure git identity
+        run: |
+          git config user.name  'mirror-sync[bot]'
+          git config user.email 'mirror-sync[bot]@users.noreply.github.com'
+
+      - name: Fetch upstream
+        id: fetch
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM_URL" 2>/dev/null \
+            || git remote set-url upstream "$UPSTREAM_URL"
+
+          # checkout の内部挙動に依存せず origin の全ブランチを remote-tracking に落とす
+          git fetch --no-tags origin '+refs/heads/*:refs/remotes/origin/*'
+
+          if ! git fetch --no-tags upstream '+refs/heads/*:refs/remotes/upstream/*'; then
+            {
+              echo '## ⚠️ 上流リポジトリに到達できませんでした'
+              echo
+              echo "\`$UPSTREAM_REPO\` が削除・非公開化・リネームされた可能性があります。"
+              echo 'このリポジトリの内容は一切変更していません（このミラーが唯一の残存コピーです）。'
+              echo
+              echo '対応: 上流が恒久的に消えた場合は、この workflow の `schedule` を削除するか'
+              echo 'Actions で本 workflow を無効化してください。'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::upstream unreachable — mirror left untouched'
+            exit 1
+          fi
+
+          # タグは create-only（既存タグは上書きしない）。衝突は個別に拒否されるので || true。
+          git fetch --no-tags upstream 'refs/tags/*:refs/tags/*' || true
+
+          if ! git rev-parse -q --verify "refs/remotes/upstream/${UPSTREAM_DEFAULT}" >/dev/null; then
+            echo "::error::upstream branch ${UPSTREAM_DEFAULT} not found"
+            exit 1
+          fi
+
+      - name: Guard — history rewrite / mass deletion
+        id: guard
+        run: |
+          set -euo pipefail
+          NEW=$(git rev-parse "refs/remotes/upstream/${UPSTREAM_DEFAULT}")
+          echo "new=$NEW" >> "$GITHUB_OUTPUT"
+
+          # 直近同期時点の上流コミット = アーカイブ用ブランチ upstream-master の先端
+          BASE=''
+          if git rev-parse -q --verify refs/remotes/origin/upstream-master >/dev/null; then
+            BASE=$(git rev-parse refs/remotes/origin/upstream-master)
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+
+          if [ -z "$BASE" ]; then
+            echo 'first sync — guards skipped'
+            echo 'changed=true' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$BASE" = "$NEW" ]; then
+            echo 'upstream unchanged'
+            echo 'changed=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+
+          FORCE='${{ inputs.allow_shrink }}'
+
+          # --- Guard 1: 上流の履歴書き換え（BASE が NEW の祖先でない） ---
+          if ! git merge-base --is-ancestor "$BASE" "$NEW"; then
+            {
+              echo '## 🛑 同期を中止しました — 上流の履歴書き換えを検知'
+              echo
+              echo "前回同期: \`$BASE\`"
+              echo "上流現在: \`$NEW\`"
+              echo
+              echo '上流が force-push（rebase / amend / 履歴削除）を行ったため、'
+              echo '追記のみでは追従できません。このリポジトリは変更していません。'
+              echo
+              echo '対応: 上流の差分を確認したうえで、手元で明示的に merge して push してください。'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::upstream history rewritten — sync aborted (nothing was overwritten)'
+            exit 1
+          fi
+
+          # --- Guard 2: 大量削除 ---
+          BEFORE=$(git ls-tree -r --name-only "$BASE"  | wc -l)
+          AFTER=$( git ls-tree -r --name-only "$NEW"   | wc -l)
+          DELETED=$(git diff --diff-filter=D --name-only "$BASE" "$NEW" | wc -l)
+          PCT=0
+          if [ "$BEFORE" -gt 0 ]; then PCT=$(( DELETED * 100 / BEFORE )); fi
+          echo "files: $BEFORE -> $AFTER (deleted $DELETED = ${PCT}%)"
+
+          TRIP=''
+          if [ "$PCT" -gt "$MAX_DELETE_PERCENT" ]; then
+            TRIP="削除率 ${PCT}% > 上限 ${MAX_DELETE_PERCENT}%"
+          fi
+          if [ "$AFTER" -lt "$MIN_FILES" ]; then
+            TRIP="${TRIP:+$TRIP / }同期後ファイル数 ${AFTER} < 下限 ${MIN_FILES}"
+          fi
+
+          if [ -n "$TRIP" ]; then
+            if [ "$FORCE" = 'true' ]; then
+              echo "::warning::deletion guard tripped ($TRIP) but allow_shrink=true — proceeding"
+            else
+              {
+                echo '## 🛑 同期を中止しました — 上流で大量のファイル削除を検知'
+                echo
+                echo "$TRIP"
+                echo
+                echo "| | ファイル数 |"
+                echo "|---|---|"
+                echo "| 同期前（上流 \`${BASE:0:7}\`） | $BEFORE |"
+                echo "| 上流現在（\`${NEW:0:7}\`） | $AFTER |"
+                echo "| 削除 | $DELETED (${PCT}%) |"
+                echo
+                echo '上流が中身を削除した（README のみ等）可能性があります。'
+                echo 'このリポジトリの内容は一切変更していません。'
+                echo
+                echo '対応: 上流の差分を確認し、意図的な変更であれば本 workflow を'
+                echo '`allow_shrink = true` で手動実行してください。'
+              } >> "$GITHUB_STEP_SUMMARY"
+              echo "::error::mass deletion detected ($TRIP) — sync aborted (nothing was overwritten)"
+              exit 1
+            fi
+          fi
+
+      # ---- ここから push。すべて非 force（サーバ側が非 FF を拒否する）----
+
+      - name: Update archival branch (upstream-master, fast-forward only)
+        if: steps.guard.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          git push origin \
+            "refs/remotes/upstream/${UPSTREAM_DEFAULT}:refs/heads/upstream-master"
+
+      - name: Merge upstream into ${{ env.UPSTREAM_DEFAULT }}
+        if: steps.guard.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          SHORT='${{ steps.guard.outputs.new }}'
+          if ! git merge --no-ff --no-edit \
+                 -m "mirror: sync upstream ${UPSTREAM_REPO}@${SHORT:0:7}" \
+                 "refs/remotes/upstream/${UPSTREAM_DEFAULT}"; then
+            git merge --abort || true
+            {
+              echo '## 🛑 マージ競合により同期を中止しました'
+              echo
+              echo '上流の変更がこのミラー固有のファイル'
+              echo '（`.github/workflows/mirror-sync.yml` / `MIRROR.md`）と競合しました。'
+              echo 'このリポジトリの内容は一切変更していません。手動で解決してください。'
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::merge conflict — sync aborted'
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/${UPSTREAM_DEFAULT}"
+
+      - name: Mirror side branches (fast-forward only, never delete)
+        if: steps.guard.outputs.changed == 'true'
+        run: |
+          set -uo pipefail
+          for b in $SIDE_BRANCHES; do
+            if ! git rev-parse -q --verify "refs/remotes/upstream/$b" >/dev/null; then
+              echo "::warning::upstream branch '$b' no longer exists — local copy kept as-is"
+              continue
+            fi
+            if git push origin "refs/remotes/upstream/$b:refs/heads/$b"; then
+              echo "synced $b"
+            else
+              echo "::warning::branch '$b' is not fast-forwardable (upstream force-pushed?) — skipped, local copy kept"
+            fi
+          done
+
+      - name: Mirror tags (create-only, never overwrite)
+        if: steps.guard.outputs.changed == 'true'
+        run: |
+          set -uo pipefail
+          # 既存タグへの push は非 force なので拒否される = 上書きされない
+          git push origin 'refs/tags/*:refs/tags/*' || \
+            echo '::notice::some tags already existed and were left untouched'
+
+      - name: Mirror releases and their assets (create-only)
+        if: inputs.sync_releases != 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rel
+          mapfile -t UP < <(gh release list --repo "$UPSTREAM_REPO" --limit 100 \
+                              --json tagName,isDraft --jq '.[] | select(.isDraft==false) | .tagName')
+          if [ "${#UP[@]}" -eq 0 ]; then echo 'no upstream releases'; exit 0; fi
+
+          MINE=$(gh release list --repo "$GITHUB_REPOSITORY" --limit 200 \
+                   --json tagName --jq '.[].tagName' || true)
+
+          for tag in "${UP[@]}"; do
+            if grep -qxF "$tag" <<< "$MINE"; then
+              echo "release $tag already mirrored — skipped"
+              continue
+            fi
+            if ! git rev-parse -q --verify "refs/tags/$tag" >/dev/null; then
+              echo "::warning::tag $tag not present in mirror — release skipped"
+              continue
+            fi
+            echo "mirroring release $tag"
+            rm -rf "/tmp/rel/$tag"; mkdir -p "/tmp/rel/$tag"
+            gh release download "$tag" --repo "$UPSTREAM_REPO" --dir "/tmp/rel/$tag" \
+              --pattern '*' --clobber || echo "::warning::no assets for $tag"
+
+            NOTES=$(gh release view "$tag" --repo "$UPSTREAM_REPO" --json body --jq '.body' || echo '')
+            TITLE=$(gh release view "$tag" --repo "$UPSTREAM_REPO" --json name --jq '.name' || echo "$tag")
+            PRE=$(gh release view "$tag" --repo "$UPSTREAM_REPO" --json isPrerelease --jq '.isPrerelease' || echo false)
+
+            printf '%s\n\n---\n*Mirrored from [%s](https://github.com/%s/releases/tag/%s).*\n' \
+              "$NOTES" "$UPSTREAM_REPO" "$UPSTREAM_REPO" "$tag" > /tmp/notes.md
+
+            ARGS=(--repo "$GITHUB_REPOSITORY" --title "${TITLE:-$tag}" --notes-file /tmp/notes.md)
+            if [ "$PRE" = 'true' ]; then ARGS+=(--prerelease); fi
+            shopt -s nullglob
+            FILES=("/tmp/rel/$tag"/*)
+            shopt -u nullglob
+            gh release create "$tag" "${ARGS[@]}" "${FILES[@]}"
+          done
+
+      - name: Heartbeat (keep scheduled workflow alive)
+        if: steps.guard.outputs.changed != 'true'
+        run: |
+          set -euo pipefail
+          LAST=$(git log -1 --format=%ct "refs/heads/${UPSTREAM_DEFAULT}")
+          NOW=$(date -u +%s)
+          DAYS=$(( (NOW - LAST) / 86400 ))
+          echo "last commit on ${UPSTREAM_DEFAULT}: ${DAYS} day(s) ago"
+          if [ "$DAYS" -lt "$HEARTBEAT_AFTER_DAYS" ]; then
+            echo 'no heartbeat needed'; exit 0
+          fi
+          # 60 日無活動で schedule が自動停止するのを防ぐための空コミット
+          mkdir -p .mirror
+          date -u +'%Y-%m-%dT%H:%M:%SZ' > .mirror/last-checked
+          git add .mirror/last-checked
+          git commit -m 'mirror: heartbeat (upstream unchanged, keeping schedule alive)'
+          git push origin "HEAD:refs/heads/${UPSTREAM_DEFAULT}"
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo '## Mirror sync'
+            echo
+            echo "| 項目 | 値 |"
+            echo "|---|---|"
+            echo "| 上流 | \`$UPSTREAM_REPO\` |"
+            echo "| 前回同期した上流コミット | \`${{ steps.guard.outputs.base }}\` |"
+            echo "| 上流の現在のコミット | \`${{ steps.guard.outputs.new }}\` |"
+            echo "| 上流に変更あり | ${{ steps.guard.outputs.changed }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
