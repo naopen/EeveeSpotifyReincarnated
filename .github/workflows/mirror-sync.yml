@@ -48,8 +48,11 @@ jobs:
       # 既定の GITHUB_TOKEN は .github/workflows/ 配下を push できない
       # （上流のコミットは workflow を変更しうるため）が、この制限は
       # GitHub App トークン固有で SSH deploy key には適用されない。
+      # v4 は Node.js 20 で非推奨。v5 は Node 24 化のみの変更なので挙動は同じ。
+      # v6 は認証情報の保持方式を変えており（persist creds to a separate file）、
+      # 後続ステップの git push が ssh-key の保持に依存しているため据え置く。
       - name: Checkout mirror (full history, all refs)
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           ref: ${{ env.UPSTREAM_DEFAULT }}
           fetch-depth: 0
