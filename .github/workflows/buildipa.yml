@@ -74,17 +74,6 @@ jobs:
           chmod +x Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh
           Tools/SwiftProtobufBuild/build-eeveeswiftprotobuf.sh
 
-      - name: Generate spoti.pw flag table from IPA
-        if: ${{ inputs.ipa_url != '' }}
-        run: |
-          # spoti.pw's flag table (SGFlagList.m) is generated from a decrypted Spotify
-          # IPA by its scripts/extract-flags.py and is gitignored upstream. Run it here
-          # against the checked-out submodule so the integrated spoti.pw in the deb
-          # gets the real table; without it the Makefile compiles the empty-table stub
-          # (Tools/SGFlagListStub.m) and the "All flags" page lists nothing.
-          wget "${{ inputs.ipa_url }}" --no-verbose -O "$RUNNER_TEMP/flags-ipa"
-          python3 Sources/EeveeSpotifyC/SubRepos/spoti.pw/scripts/extract-flags.py "$RUNNER_TEMP/flags-ipa"
-
       - name: Build .deb (rootless)
         env:
           REPO_SLUG: ${{ github.repository }}
@@ -121,12 +110,6 @@ jobs:
         run: |
           chmod +x Tools/build-zxpi.sh
           Tools/build-zxpi.sh
-
-      - name: LC-inject zxPluginsInject (ipapatch)
-        if: ${{ inputs.ipa_url != '' && inputs.patch_ipa == true }}
-        run: |
-          ipapatch --input "$OUT_IPA" --inplace --noconfirm \
-                   --dylib packages/zxPluginsInject.dylib
 
       - name: Fetch OpenSpotifySafariExtension.appex
         if: ${{ inputs.ipa_url != '' }}
@@ -166,6 +149,12 @@ jobs:
                -f "${INJECT[@]}" -c 9 -m 15.0 -du
           echo "OUT_IPA=$OUT" >> $GITHUB_ENV
 
+      - name: LC-inject zxPluginsInject (ipapatch)
+        if: ${{ inputs.ipa_url != '' && inputs.patch_ipa == true }}
+        run: |
+          ipapatch --input "$OUT_IPA" --inplace --noconfirm \
+                   --dylib packages/zxPluginsInject.dylib
+
       - name: Strip incompatible bundles
         if: ${{ inputs.ipa_url != '' }}
         run: |
@@ -186,9 +175,6 @@ jobs:
           zip -qry "$(basename "$OUT_IPA")" Payload
           rm -rf Payload
 
-      # NOTE: Removed the post-injection ipapatch step.
-      # If you later need it back, restore the "LC-inject zxPluginsInject (ipapatch)" step.
-      
       - name: Strip Watch app (if any survived)
         if: ${{ inputs.ipa_url != '' }}
         run: |

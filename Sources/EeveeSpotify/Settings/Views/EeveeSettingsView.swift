@@ -145,19 +145,6 @@ struct EeveeSettingsView: View {
                 )
             }
 
-            Button {
-                // spoti.pw is a UIKit page (an SGPage), not a SwiftUI view, so it's pushed
-                // directly onto the same navigation stack instead of going through
-                // pushSettingsController(with:title:), which wraps a SwiftUI view.
-                navigationController.pushViewController(SGModSettingsPage(), animated: true)
-            } label: {
-                NavigationSectionView(
-                    color: Color(hex: "#1ED760"),
-                    title: "spoti.pw",
-                    imageSystemName: "slider.horizontal.3"
-                )
-            }
-
             //
 
             Section {
