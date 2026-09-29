@@ -1,5 +1,4 @@
-# iOS 15.0 floor: the Swift side guards its iOS 15/16 APIs with #available.
-TARGET := iphone:clang:latest:15.0
+TARGET := iphone:clang:latest:14.0
 INSTALL_TARGET_PROCESSES = Spotify
 ARCHS = arm64
 

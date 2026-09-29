@@ -219,7 +219,7 @@ func eeveeEnvFlag(_ name: String) -> Bool {
 
 struct EeveeSpotify: Tweak {
     static let version = "6.6.8"
-    static let buildNumber = "2"
+    static let buildNumber = "4"
     static let repoSlug = GeneratedConfig.repoSlug
     
     static var hookTarget: VersionHookTarget {
@@ -292,6 +292,10 @@ struct EeveeSpotify: Tweak {
         // Block the newer Swift service-backed Premium sheets/cards used by
         // Spotify 9.1.x. Each target is runtime-gated for minor-version safety.
         activateUpsellServiceBlocker()
+
+        // Block ClientMessagingPlatform marketing surfaces (9.1.84 win-back
+        // fullscreen takeover and Home Premium banner) and their element views.
+        activateClientMessagingPlatformBlocker()
 
         // Block upsell components injected into Hub/home JSON (e.g. upgrade banners).
         if NSClassFromString("HUBViewModelBuilderImplementation") != nil {
