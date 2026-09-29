@@ -36,6 +36,39 @@
 Actions から本 workflow を **`allow_shrink = true`** で手動実行してください。
 しきい値は workflow の `env:` の `MAX_DELETE_PERCENT` / `MIN_FILES` で調整できます。
 
+### 履歴書き換え検知で止まった場合の復旧手順
+
+上流が force-push すると、以後の定期実行は毎回このガードで失敗し続けます。
+上流の差分を確認して問題なければ、手元で以下を行ってください
+（`<OLD>` = 失敗ログの「前回同期」、`<NEW>` = 「上流現在」のコミット）。
+
+```sh
+git clone https://github.com/naopen/EeveeSpotifyReincarnated.git && cd EeveeSpotifyReincarnated
+git remote add upstream https://github.com/SideloadLabs/EeveeSpotifyReincarnated.git
+git fetch --no-tags upstream '+refs/heads/*:refs/remotes/upstream/*'
+
+# 1. Master に上流をマージ。競合は上流側を採用し、ミラー固有ファイルだけ残す
+git merge --no-ff --no-commit upstream/Master
+git rm -rq --cached . && git read-tree upstream/Master
+git checkout origin/Master -- .github/workflows/mirror-sync.yml MIRROR.md .mirror
+git checkout-index -af && git clean -fd
+git diff --cached --stat upstream/Master   # ミラー固有ファイルだけが差分に出ることを確認
+git commit -m "mirror: sync upstream SideloadLabs/EeveeSpotifyReincarnated@<NEW の先頭7桁> (manual, upstream history rewritten)"
+git push origin HEAD:Master
+
+# 2. 旧 upstream-master の先端をタグで保全
+git tag archive/upstream-master-<OLD の先頭7桁> <OLD>
+git push origin refs/tags/archive/upstream-master-<OLD の先頭7桁>
+
+# 3. upstream-master を上流の新 HEAD に合わせる（ここだけ強制更新）
+git push --force-with-lease=upstream-master:<OLD> origin \
+  refs/remotes/upstream/Master:refs/heads/upstream-master
+```
+
+その後 Actions から Mirror Sync を手動実行して成功を確認します。
+旧コミットは `Master` の履歴と `archive/*` タグに残るため、何も失われません。
+（前例: 2026-09 に上流が spoti.pw 関連コミットを削除 → `archive/upstream-master-ee5c721`）
+
 上流が恒久的に消えた場合は、同期 workflow を無効化してください
 （Actions → Mirror Sync → ⋯ → Disable workflow）。ミラーの内容はそのまま残ります。
 
